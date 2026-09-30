@@ -90,6 +90,8 @@ struct App {
     profiles: Vec<Profile>,
     dir: String,
     name: String,
+    directory_history: Vec<String>,
+    project_directories: Vec<String>,
     suggestions: Vec<String>,
     suggest_idx: usize,
     dir_committed: bool,
@@ -112,22 +114,13 @@ struct App {
 
 impl App {
     fn new(profiles: Vec<Profile>, theme: Theme) -> Self {
-        let mut dir = std::env::var("WORKSPACE_FORM_CWD").unwrap_or_default();
-        if dir.is_empty() {
-            dir = std::env::var("HERDR_WORKSPACE_CWD").unwrap_or_default();
-        }
-        if dir.is_empty() {
-            dir = complete::home_dir().to_string_lossy().into_owned();
-        }
-        if !dir.ends_with('/') {
-            dir.push('/');
-        }
-        let name = complete::default_name_from_dir(&dir);
         let mut app = Self {
             theme,
             profiles,
-            dir,
-            name,
+            dir: String::new(),
+            name: String::new(),
+            directory_history: complete::directory_history(),
+            project_directories: complete::project_directories(),
             suggestions: Vec::new(),
             suggest_idx: 0,
             dir_committed: false,
@@ -151,7 +144,11 @@ impl App {
     }
 
     fn refresh_suggestions(&mut self) {
-        self.suggestions = complete::suggestions(&self.dir);
+        self.suggestions = complete::suggestions(
+            &self.dir,
+            &self.directory_history,
+            &self.project_directories,
+        );
         if self.suggest_idx >= self.suggestions.len() {
             self.suggest_idx = 0;
         }
@@ -184,6 +181,7 @@ impl App {
                 self.dir_committed = false;
                 self.name_committed = false;
                 self.error.clear();
+                self.suggest_idx = 0;
                 self.refresh_suggestions();
             }
             KeyCode::Backspace => {
@@ -191,6 +189,7 @@ impl App {
                 self.dir_committed = false;
                 self.name_committed = false;
                 self.error.clear();
+                self.suggest_idx = 0;
                 self.refresh_suggestions();
             }
             KeyCode::Down => self.move_suggest(1),
@@ -198,6 +197,7 @@ impl App {
             KeyCode::Tab => {
                 if let Some(s) = self.suggestions.get(self.suggest_idx).cloned() {
                     self.dir = complete::accept(&s);
+                    self.suggest_idx = 0;
                     self.refresh_suggestions();
                 }
             }
@@ -343,7 +343,7 @@ impl App {
 
     fn apply_dir(&mut self, path: &str) {
         let trimmed = path.trim();
-        if !complete::is_existing_dir(trimmed) {
+        if trimmed.is_empty() || !complete::is_existing_dir(trimmed) {
             self.error = "not a directory".into();
             return;
         }
@@ -583,13 +583,25 @@ impl App {
             );
             return;
         }
+        let start = self
+            .suggest_idx
+            .saturating_add(1)
+            .saturating_sub(area.height as usize);
+        let total = self.suggestions.len();
         let lines: Vec<Line> = self
             .suggestions
             .iter()
             .enumerate()
+            .skip(start)
+            .take(area.height as usize)
             .map(|(i, s)| {
                 let selected = self.focus == Focus::Dir && i == self.suggest_idx;
-                Line::from(Span::styled(format!("  {s}"), self.theme.suggest(selected)))
+                let text = if total > area.height as usize {
+                    format!("  {}/{total} {s}", i + 1)
+                } else {
+                    format!("  {s}")
+                };
+                Line::from(Span::styled(text, self.theme.suggest(selected)))
             })
             .collect();
         f.render_widget(Paragraph::new(lines), area);
@@ -780,7 +792,22 @@ mod tests {
     }
 
     fn app() -> App {
-        App::new(sample(), Theme::load())
+        let mut app = App::new(sample(), Theme::load());
+        app.directory_history.clear();
+        app.project_directories.clear();
+        app.refresh_suggestions();
+        app
+    }
+
+    #[test]
+    fn starts_without_prefilling_directory_or_name() {
+        let mut app = app();
+        assert!(app.dir.is_empty());
+        assert!(app.name.is_empty());
+        app.suggestions.clear();
+        app.commit_dir();
+        assert!(!app.dir_committed);
+        assert_eq!(app.focus, Focus::Dir);
     }
 
     #[test]
@@ -868,6 +895,45 @@ mod tests {
         assert_eq!(app.suggest_idx, 0);
         app.key_dir(KeyCode::Char('k'), KeyModifiers::CONTROL);
         assert_eq!(app.suggest_idx, 2);
+    }
+
+    #[test]
+    fn enter_selects_match_beyond_four_visible_rows() {
+        let tree = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.suggestions = (0..6)
+            .map(|i| {
+                let path = tree.path().join(format!("web-{i}"));
+                std::fs::create_dir(&path).unwrap();
+                format!("{}/", path.display())
+            })
+            .collect();
+        for _ in 0..5 {
+            app.key_dir(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        }
+        assert_eq!(app.suggest_idx, 5);
+        app.key_dir(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.dir.ends_with("web-5/"));
+        assert_eq!(app.name, "web-5");
+    }
+
+    #[test]
+    fn typing_resets_highlight_before_enter() {
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tree.path().join("alpha")).unwrap();
+        std::fs::create_dir(tree.path().join("alpine")).unwrap();
+        std::fs::create_dir(tree.path().join("alpinist")).unwrap();
+        let mut app = app();
+        app.directory_history.clear();
+        app.dir = format!("{}/alp", tree.path().display());
+        app.refresh_suggestions();
+        app.key_dir(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert_eq!(app.suggest_idx, 1);
+        app.key_dir(KeyCode::Char('i'), KeyModifiers::NONE);
+        assert_eq!(app.suggest_idx, 0);
+        app.key_dir(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.dir.ends_with("alpine/"), "{}", app.dir);
+        assert_eq!(app.name, "alpine");
     }
 
     #[test]

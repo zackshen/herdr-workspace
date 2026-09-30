@@ -28,6 +28,10 @@ the plugin config.
 ## Requirements
 
 - [Herdr](https://herdr.dev) ≥ 0.8.0
+- [fzf](https://github.com/junegunn/fzf) for inline fuzzy directory suggestions.
+- [fd](https://github.com/sharkdp/fd) for unvisited directories under
+  `~/projects` and `~/devdash`; [zoxide](https://github.com/ajeetdsouza/zoxide)
+  adds visited-directory history. Either source may be absent.
 - Rust toolchain only if you build from source. `herdr plugin install`
   downloads a prebuilt binary.
 
@@ -79,9 +83,15 @@ herdr server reload-config
 
 ## Popup flow
 
-1. **Directory** — type a path. Matching child directories appear as you type.
-   `Tab` accepts a suggestion. `Enter` commits an existing directory and moves
-   to the name field.
+1. **Directory** — starts empty. Type a path fragment to filter zoxide's
+   visited directories, nearby children, and unvisited directories under
+   `~/projects` and `~/devdash` (up to four directory levels deep). The fd
+   scan runs once when the form opens, not across all of `$HOME`. fzf ranks
+   matches inline; four rows are visible at a time, with `Ctrl-J`/`Ctrl-K` or
+   Up/Down scrolling through further results. Type more of a name (for example,
+   `web_server`) to narrow crowded results. `Tab` accepts a suggestion into
+   the field; `Enter` commits the highlighted directory and moves to Name.
+   Manual paths still work when fd or zoxide is unavailable.
 2. **Name** — workspace label. Defaults to the last path component. `Enter`
    shows the profile cards.
 3. **Profiles** — one card per `[[profiles]]` in config. Arrow keys or click
