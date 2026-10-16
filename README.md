@@ -28,10 +28,9 @@ the plugin config.
 ## Requirements
 
 - [Herdr](https://herdr.dev) ≥ 0.8.0
-- [fzf](https://github.com/junegunn/fzf) for inline fuzzy directory suggestions.
-- [fd](https://github.com/sharkdp/fd) for unvisited directories under
-  `~/projects` and `~/devdash`; [zoxide](https://github.com/ajeetdsouza/zoxide)
-  adds visited-directory history. Either source may be absent.
+- [fzf](https://github.com/junegunn/fzf) provides inline fuzzy directory completion.
+- [fd](https://github.com/sharkdp/fd) indexes `~/projects` and `~/devdash` to a depth of four.
+- [zoxide](https://github.com/ajeetdsouza/zoxide) supplies optional directory history.
 - Rust toolchain only if you build from source. `herdr plugin install`
   downloads a prebuilt binary.
 
@@ -60,6 +59,12 @@ mkdir -p bin && cp target/release/herdr-workspace bin/
 herdr plugin link /path/to/herdr-workspace
 ```
 
+On macOS, replace the binary atomically after a rebuild:
+
+```bash
+install -S -m 755 target/release/herdr-workspace bin/herdr-workspace
+```
+
 Herdr does **not** bind keys declared in a plugin manifest. Add a binding to
 `~/.config/herdr/config.toml` and reload:
 
@@ -83,15 +88,21 @@ herdr server reload-config
 
 ## Popup flow
 
-1. **Directory** — starts empty. Type a path fragment to filter zoxide's
-   visited directories, nearby children, and unvisited directories under
-   `~/projects` and `~/devdash` (up to four directory levels deep). The fd
-   scan runs once when the form opens, not across all of `$HOME`. fzf ranks
-   matches inline; four rows are visible at a time, with `Ctrl-J`/`Ctrl-K` or
-   Up/Down scrolling through further results. Type more of a name (for example,
-   `web_server`) to narrow crowded results. `Tab` accepts a suggestion into
-   the field; `Enter` commits the highlighted directory and moves to Name.
-   Manual paths still work when fd or zoxide is unavailable.
+1. **Directory** starts empty.
+   Completion uses directory history, immediate child directories, and the original bounded project index.
+   The index covers `~/projects` and `~/devdash` to a depth of four.
+   The index excludes `.git`, `node_modules`, `target`, and `.venv`.
+   The form does not scan the complete home tree.
+   Matching uses directory names first, then complete history paths.
+   Four rows remain visible, with scrolling through additional matches for a nonempty query.
+   Manual paths and the directory picker work without search dependencies.
+
+   1. Type a path or a fuzzy directory name.
+   2. Use Up/Down or `Ctrl-J`/`Ctrl-K` to select a result.
+   3. Press `Tab` to copy the selected path into Directory.
+   4. Press `Enter` to commit the selected directory or a valid manual path.
+   5. Click **Browse (Ctrl-O)** to open the directory picker.
+
 2. **Name** — workspace label. Defaults to the last path component. `Enter`
    shows the profile cards.
 3. **Profiles** — one card per `[[profiles]]` in config. Arrow keys or click
@@ -100,6 +111,24 @@ herdr server reload-config
    the selected profile.
 
 `Esc` is Cancel.
+
+### Directory picker
+
+The picker reads one directory at a time.
+It includes hidden directories, ignored directories, and directory symlinks.
+It does not require `fd`, `fzf`, or `zoxide`.
+The **Browse (Ctrl-O)** button sits beside Directory.
+`Ctrl-O` opens the same picker when Directory has focus.
+The `./` entry represents the current directory.
+Cancel keeps the existing Directory input, Name, and profile.
+
+1. Click **Browse (Ctrl-O)** to open the picker.
+2. Use Up/Down to highlight a directory.
+3. Press Right to open the highlighted directory.
+4. Press Left or Backspace to open the parent directory.
+5. Press Enter to choose the highlighted directory.
+6. Press Escape to return without a selection.
+
 
 ## Worktree popup
 

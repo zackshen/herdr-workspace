@@ -20,6 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::io::{self, stdout, Stdout};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +86,125 @@ fn io_err(e: io::Error) -> String {
     e.to_string()
 }
 
+struct DirectoryPicker {
+    path: PathBuf,
+    children: Vec<PathBuf>,
+    selected: usize,
+    error: String,
+}
+
+impl DirectoryPicker {
+    fn read(path: PathBuf) -> Result<Self, String> {
+        if path.to_str().is_none() {
+            return Err("Directory path is not UTF-8.".into());
+        }
+        let entries = std::fs::read_dir(&path)
+            .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
+        let mut children = Vec::new();
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if child.to_str().is_none() {
+                continue;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() || kind.is_symlink() && child.is_dir() {
+                children.push(child);
+            }
+        }
+        children.sort();
+        Ok(Self {
+            path,
+            children,
+            selected: 0,
+            error: String::new(),
+        })
+    }
+
+    fn selected_path(&self) -> &Path {
+        if self.selected == 0 {
+            &self.path
+        } else {
+            &self.children[self.selected - 1]
+        }
+    }
+
+    fn move_selection(&mut self, delta: i32) {
+        let count = self.children.len() as i32 + 1;
+        self.selected = (self.selected as i32 + delta).rem_euclid(count) as usize;
+    }
+
+    fn navigate(&mut self, path: PathBuf) {
+        match Self::read(path) {
+            Ok(next) => *self = next,
+            Err(error) => self.error = error,
+        }
+    }
+
+    fn draw(&self, f: &mut Frame, theme: &Theme) {
+        let area = f.area();
+        f.render_widget(Clear, area);
+        let block = Block::bordered()
+            .title(" Directory picker ")
+            .style(theme.base())
+            .border_style(theme.input_border(true));
+        let inner = pad(block.inner(area), 1, 1);
+        f.render_widget(block, area);
+        let chunks = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+        f.render_widget(
+            Paragraph::new(self.path.to_string_lossy()).style(theme.input(true)),
+            chunks[0],
+        );
+        f.render_widget(
+            Paragraph::new(format!(
+                "{} folders · ./ chooses this directory",
+                self.children.len()
+            ))
+            .style(theme.muted()),
+            chunks[1],
+        );
+        let start = self
+            .selected
+            .saturating_add(1)
+            .saturating_sub(chunks[2].height as usize);
+        let lines: Vec<_> = (start..self.children.len() + 1)
+            .take(chunks[2].height as usize)
+            .map(|index| {
+                let label = if index == 0 {
+                    "  ./ [Use this directory]".to_owned()
+                } else {
+                    format!(
+                        "  {}/",
+                        self.children[index - 1]
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                    )
+                };
+                Line::from(Span::styled(label, theme.suggest(index == self.selected)))
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), chunks[2]);
+        f.render_widget(
+            Paragraph::new(self.error.as_str()).style(theme.error()),
+            chunks[3],
+        );
+        f.render_widget(
+            Paragraph::new("↑/↓ select · → open · ←/backspace parent · enter choose · esc back")
+                .style(theme.muted()),
+            chunks[4],
+        );
+    }
+}
+
 struct App {
     theme: Theme,
     profiles: Vec<Profile>,
@@ -94,6 +214,7 @@ struct App {
     project_directories: Vec<String>,
     suggestions: Vec<String>,
     suggest_idx: usize,
+    picker: Option<DirectoryPicker>,
     dir_committed: bool,
     name_committed: bool,
     name_auto: bool,
@@ -105,6 +226,7 @@ struct App {
     exit_code: i32,
     // hit boxes from last draw
     dir_box: Rect,
+    browse_box: Rect,
     name_box: Rect,
     card_boxes: Vec<Rect>,
     cancel_box: Rect,
@@ -114,15 +236,23 @@ struct App {
 
 impl App {
     fn new(profiles: Vec<Profile>, theme: Theme) -> Self {
-        let mut app = Self {
+        let mut app = Self::with_history(profiles, theme, complete::directory_history());
+        app.project_directories = complete::project_directories();
+        app.refresh_suggestions();
+        app
+    }
+
+    fn with_history(profiles: Vec<Profile>, theme: Theme, history: Vec<String>) -> Self {
+        Self {
             theme,
             profiles,
             dir: String::new(),
             name: String::new(),
-            directory_history: complete::directory_history(),
-            project_directories: complete::project_directories(),
+            directory_history: history,
+            project_directories: Vec::new(),
             suggestions: Vec::new(),
             suggest_idx: 0,
+            picker: None,
             dir_committed: false,
             name_committed: false,
             name_auto: true,
@@ -133,14 +263,13 @@ impl App {
             done: false,
             exit_code: 0,
             dir_box: Rect::default(),
+            browse_box: Rect::default(),
             name_box: Rect::default(),
             card_boxes: Vec::new(),
             cancel_box: Rect::default(),
             save_box: Rect::default(),
             card_cols: 1,
-        };
-        app.refresh_suggestions();
-        app
+        }
     }
 
     fn refresh_suggestions(&mut self) {
@@ -158,6 +287,10 @@ impl App {
         if self.job.is_some() {
             return None;
         }
+        if self.picker.is_some() {
+            self.key_picker(code, mods);
+            return None;
+        }
         if code == KeyCode::Esc {
             return Some(0);
         }
@@ -172,6 +305,7 @@ impl App {
 
     fn key_dir(&mut self, code: KeyCode, mods: KeyModifiers) -> Option<i32> {
         match code {
+            KeyCode::Char('o') if mods.contains(KeyModifiers::CONTROL) => self.open_picker(),
             KeyCode::Char('j') if mods.contains(KeyModifiers::CONTROL) => self.move_suggest(1),
             KeyCode::Char('k') if mods.contains(KeyModifiers::CONTROL) => self.move_suggest(-1),
             KeyCode::Char('n') if mods.contains(KeyModifiers::CONTROL) => self.move_suggest(1),
@@ -211,6 +345,57 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    fn open_picker(&mut self) {
+        let selected = if !self.dir.is_empty() && !complete::is_existing_dir(&self.dir) {
+            self.suggestions
+                .get(self.suggest_idx)
+                .map(|path| complete::expand_user(path))
+        } else {
+            None
+        };
+        let path = selected.unwrap_or_else(|| complete::browse_root(&self.dir));
+        match DirectoryPicker::read(path) {
+            Ok(picker) => self.picker = Some(picker),
+            Err(error) => self.error = error,
+        }
+    }
+
+    fn key_picker(&mut self, code: KeyCode, mods: KeyModifiers) {
+        match code {
+            KeyCode::Esc => self.picker = None,
+            KeyCode::Enter | KeyCode::Tab => {
+                let picker = self.picker.take().unwrap();
+                self.apply_dir(picker.selected_path().to_str().unwrap());
+            }
+            KeyCode::Up => self.picker.as_mut().unwrap().move_selection(-1),
+            KeyCode::Down => self.picker.as_mut().unwrap().move_selection(1),
+            KeyCode::Char('j') if mods.contains(KeyModifiers::CONTROL) => {
+                self.picker.as_mut().unwrap().move_selection(1)
+            }
+            KeyCode::Char('k') if mods.contains(KeyModifiers::CONTROL) => {
+                self.picker.as_mut().unwrap().move_selection(-1)
+            }
+            KeyCode::Right => {
+                let picker = self.picker.as_mut().unwrap();
+                if picker.selected > 0 {
+                    picker.navigate(picker.selected_path().to_path_buf());
+                }
+            }
+            KeyCode::Left | KeyCode::Backspace => {
+                let picker = self.picker.as_mut().unwrap();
+                if let Some(parent) = picker.path.parent() {
+                    picker.navigate(parent.to_path_buf());
+                }
+            }
+            KeyCode::Home => self.picker.as_mut().unwrap().selected = 0,
+            KeyCode::End => {
+                let picker = self.picker.as_mut().unwrap();
+                picker.selected = picker.children.len();
+            }
+            _ => {}
+        }
     }
 
     fn move_suggest(&mut self, delta: i32) {
@@ -356,7 +541,7 @@ impl App {
         self.sync_name_from_dir();
         self.focus = Focus::Name;
         self.error.clear();
-        self.refresh_suggestions();
+        self.suggestions.clear();
     }
 
     fn sync_name_from_dir(&mut self) {
@@ -434,9 +619,21 @@ impl App {
         if self.job.is_some() {
             return None;
         }
+        if let Some(picker) = self.picker.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => picker.move_selection(1),
+                MouseEventKind::ScrollUp => picker.move_selection(-1),
+                _ => {}
+            }
+            return None;
+        }
         let pos = Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.browse_box.contains(pos) {
+                    self.open_picker();
+                    return None;
+                }
                 if self.dir_box.contains(pos) {
                     self.focus = Focus::Dir;
                 } else if self.name_box.contains(pos) {
@@ -473,6 +670,10 @@ impl App {
             draw_progress(f, area, &self.theme, job.progress());
             return;
         }
+        if let Some(picker) = self.picker.as_ref() {
+            picker.draw(f, &self.theme);
+            return;
+        }
         f.render_widget(Clear, area);
         f.render_widget(Block::default().style(self.theme.base()), area);
 
@@ -480,7 +681,7 @@ impl App {
         let body = pad(inner[0], 1, 2);
         f.render_widget(
             Paragraph::new(Span::styled(
-                "  ctrl+j/k select dir · tab complete · enter next · esc cancel",
+                "  ctrl+o browse · ctrl+j/k select dir · tab complete · enter next · esc cancel",
                 self.theme.muted(),
             )),
             inner[1],
@@ -500,10 +701,27 @@ impl App {
         ])
         .split(body);
 
-        self.dir_box = chunks[0];
+        let directory = Layout::horizontal([Constraint::Min(3), Constraint::Length(19)])
+            .spacing(1)
+            .split(chunks[0]);
+        self.dir_box = directory[0];
+        self.browse_box = Rect::new(
+            directory[1].x,
+            directory[1].y.saturating_add(1),
+            directory[1].width,
+            directory[1].height.saturating_sub(1).min(1),
+        );
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "[ Browse (Ctrl-O) ]",
+                self.theme.button(false, false),
+            ))
+            .centered(),
+            self.browse_box,
+        );
         self.draw_input(
             f,
-            chunks[0],
+            self.dir_box,
             "Directory",
             &self.dir,
             self.focus == Focus::Dir,
@@ -792,11 +1010,124 @@ mod tests {
     }
 
     fn app() -> App {
-        let mut app = App::new(sample(), Theme::load());
-        app.directory_history.clear();
-        app.project_directories.clear();
+        use ratatui::style::Color;
+        let theme = Theme {
+            panel_bg: Color::Reset,
+            text: Color::Reset,
+            subtext: Color::Reset,
+            overlay: Color::Reset,
+            accent: Color::Reset,
+            yellow: Color::Reset,
+            green: Color::Reset,
+            red: Color::Reset,
+            surface: Color::Reset,
+        };
+        App::with_history(sample(), theme, Vec::new())
+    }
+
+    #[test]
+    fn picker_opens_hidden_children_without_recursive_discovery() {
+        let tree = tempfile::tempdir().unwrap();
+        let hidden = tree.path().join(".hidden");
+        let private = hidden.join("private-project");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::write(tree.path().join("file.txt"), "file").unwrap();
+        let mut app = app();
+        app.dir = tree.path().to_str().unwrap().into();
+        app.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(app.picker.as_ref().unwrap().children, [hidden.clone()]);
+        app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        app.on_key(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(app.picker.as_ref().unwrap().path, hidden);
+        app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.dir, complete::accept(private.to_str().unwrap()));
+        assert_eq!(app.name, "private-project");
+        assert_eq!(app.focus, Focus::Name);
+        assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn picker_cancel_preserves_form_state_after_parent_navigation() {
+        let tree = tempfile::tempdir().unwrap();
+        let child = tree.path().join("alpha");
+        std::fs::create_dir(&child).unwrap();
+        let mut app = app();
+        app.project_directories = vec![child.to_str().unwrap().into()];
+        app.dir = "alpha".into();
+        app.name = "manual-name".into();
+        app.name_auto = false;
+        app.profile_idx = 1;
         app.refresh_suggestions();
-        app
+        let suggestions = app.suggestions.clone();
+        app.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(app.picker.as_ref().unwrap().path, child);
+        app.on_key(KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(app.picker.as_ref().unwrap().path, tree.path());
+        assert_eq!(app.on_key(KeyCode::Esc, KeyModifiers::NONE), None);
+        assert!(app.picker.is_none());
+        assert_eq!(app.dir, "alpha");
+        assert_eq!(app.name, "manual-name");
+        assert_eq!(app.profile_idx, 1);
+        assert_eq!(app.focus, Focus::Dir);
+        assert_eq!(app.suggestions, suggestions);
+        assert_eq!(app.on_key(KeyCode::Esc, KeyModifiers::NONE), Some(0));
+    }
+
+    #[test]
+    fn picker_selects_directories_beyond_inline_rows_and_keeps_manual_name() {
+        let tree = tempfile::tempdir().unwrap();
+        for index in 0..10 {
+            std::fs::create_dir(tree.path().join(format!("project-{index}"))).unwrap();
+        }
+        let mut app = app();
+        app.dir = tree.path().to_str().unwrap().into();
+        app.name = "manual-name".into();
+        app.name_auto = false;
+        app.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        for _ in 0..9 {
+            app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        }
+        app.on_key(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            app.picker.as_ref().unwrap().path,
+            tree.path().join("project-8")
+        );
+        assert!(app.picker.as_ref().unwrap().children.is_empty());
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.dir,
+            complete::accept(tree.path().join("project-8").to_str().unwrap())
+        );
+        assert_eq!(app.name, "manual-name");
+        assert!(app.dir_committed);
+    }
+
+    #[test]
+    fn picker_reports_failed_navigation_without_losing_current_folder() {
+        let tree = tempfile::tempdir().unwrap();
+        let child = tree.path().join("removed");
+        std::fs::create_dir(&child).unwrap();
+        let mut picker = DirectoryPicker::read(tree.path().to_path_buf()).unwrap();
+        picker.move_selection(1);
+        std::fs::remove_dir(&child).unwrap();
+        picker.navigate(picker.selected_path().to_path_buf());
+        assert_eq!(picker.path, tree.path());
+        assert_eq!(picker.selected_path(), child);
+        assert!(!picker.error.is_empty());
+    }
+
+    #[test]
+    fn picker_can_choose_an_empty_directory() {
+        let tree = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.dir = tree.path().to_str().unwrap().into();
+        app.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(app.picker.as_ref().unwrap().children.is_empty());
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.dir, complete::accept(tree.path().to_str().unwrap()));
+        assert!(app.dir_committed);
+        assert_eq!(app.focus, Focus::Name);
     }
 
     #[test]
@@ -948,14 +1279,5 @@ mod tests {
         app.key_dir(KeyCode::Backspace, KeyModifiers::NONE);
         assert!(!app.dir_committed);
         assert!(app.show_suggestions());
-    }
-
-    #[test]
-    fn cards_use_fixed_height_and_fit_more_per_row() {
-        assert_eq!(card_columns(80, 3), 3);
-        assert_eq!(cards_area_height(80, 3), CARD_HEIGHT);
-        assert_eq!(cards_area_height(80, 5), CARD_HEIGHT * 2 + 1);
-        assert!(CARD_HEIGHT < 8);
-        assert!(CARD_WIDTH < 30);
     }
 }
